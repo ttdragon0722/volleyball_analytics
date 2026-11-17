@@ -11,6 +11,7 @@ Labels go into the same annotations.db as vb_annotator (override with VB_ANNOTAT
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import threading
 import webbrowser
@@ -39,6 +40,7 @@ def main(argv: list[str] | None = None) -> None:
     from .file_dialog import FileDialog
     from .model_job import ModelRunner
     from .model_registry import ModelRegistry
+    from .quiet_loop import serve_quietly
 
     url = f"http://{args.host}:{args.port}"
     print(f"VideoMAE Labeler → {url}   (DB: {Path(args.db).resolve()})")
@@ -47,7 +49,8 @@ def main(argv: list[str] | None = None) -> None:
     registry = ModelRegistry(DEFAULT_MODEL_DIR, DEFAULT_MODELS_ROOT, extra=args.model)
     app = create_app(args.db, models=ModelRunner(registry),
                      dialog=FileDialog(args.video_dir))
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning"))
+    asyncio.run(serve_quietly(server))
 
 
 if __name__ == "__main__":
