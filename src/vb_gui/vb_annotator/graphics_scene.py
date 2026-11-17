@@ -1,0 +1,1244 @@
+"""
+Annotation Scene Module
+
+This module provides the main scene for displaying and interacting with annotations
+on images. It supports both rectangle and polygon annotations with layer management,
+label support, and interaction capabilities including drawing, editing, and deletion.
+"""
+
+from __future__ import annotations
+from typing import List, Optional, Dict
+
+from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt6.QtGui import QColor, QPen, QPolygonF, QAction, QUndoStack, QKeySequence, QTransform, QPainterPath, \
+    QIntValidator
+from PyQt6.QtWidgets import (QGraphicsScene, QGraphicsPixmapItem, QGraphicsLineItem,
+                             QGraphicsEllipseItem, QGraphicsTextItem, QMenu, QMessageBox, QGraphicsPathItem,
+                             QWidgetAction, QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget, QVBoxLayout)
+
+from ui.calibration_overlay import CalibrationOverlay
+from ui.drawing_tools import AnnotationRectItem, AnnotationPolygonItem
+from ui.undo_manager import (
+    DeleteAnnotationCommand,
+    CreateAnnotationCommand,
+    ChangeLabelCommand,
+    BulkCreateAnnotationCommand,
+    ChangeTrackInfoCommand
+)
+
+from database.db import DatabaseManager
+from database.data import Layer, Label, Annotation
+
+from services.pose_schema import SKELETON_EDGES, KEYPOINT_CONFIDENCE_THRESHOLD
+
+TRACKABLE_LAYERS = ("players", "ball")
+TRACK_ID_MAX = 99
+TEAM_ID_MAX = 2
+
+
+class ToolMode:
+    """
+    Constants defining the available annotation tools.
+    RECTANGLE: Draw rectangular annotations
+    POLYGON: Draw polygonal annotations (closed shapes with multiple vertices)
+    """
+    RECTANGLE = "rectangle"
+    POLYGON = "polygon"
+    NONE = "none"  # neutral mode:
+
+
+class PoseOverlayItem(QGraphicsPathItem):
+    """
+    A one-off, read-only visualization of a pose-model result — NOT an
+    annotation. It's never written to the database, never selectable,
+    movable, or hoverable, and it disappears the moment the scene's
+    selection changes (see AnnotationScene's selectionChanged wiring) or
+    the frame changes. Its only job is "show what the pose model sees
+    inside this box" as a disposable preview.
+
+    Added as a CHILD of the AnnotationRectItem it was detected from, so
+    it tracks correctly if that box is ever dragged, and is automatically
+    destroyed if the box itself is ever deleted. `points` must already be
+    expressed in the PARENT item's local coordinate frame (i.e. via
+    parent.mapFromScene(...)), not scene coordinates.
+    """
+    JOINT_RADIUS = 3.0
+
+    def __init__(self, points: dict, confidences: dict, parent_item):
+        super().__init__(parent_item)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setAcceptHoverEvents(False)
+        self.setZValue(parent_item.zValue() + 1)
+        self.setPen(QPen(QColor('#00E5FF'), 2))
+        self.setBrush(QColor(0, 229, 255, 60))
+
+        path = QPainterPath()
+
+        for name_a, name_b in SKELETON_EDGES:
+            pa, pb = points.get(name_a), points.get(name_b)
+            if pa is None or pb is None:
+                continue
+            if (confidences.get(name_a, 0.0) < KEYPOINT_CONFIDENCE_THRESHOLD
+                    or confidences.get(name_b, 0.0) < KEYPOINT_CONFIDENCE_THRESHOLD):
+                continue
+            path.moveTo(pa)
+            path.lineTo(pb)
+
+        for name, pt in points.items():
+            if confidences.get(name, 0.0) < KEYPOINT_CONFIDENCE_THRESHOLD:
+                continue
+            path.addEllipse(pt, self.JOINT_RADIUS, self.JOINT_RADIUS)
+
+        self.setPath(path)
+
+
+class AnnotationScene(QGraphicsScene):
+    """
+    Main scene class for managing annotations on images.
+
+    This class handles:
+    - Displaying images and annotations
+    - Creating new annotations (rectangles and polygons)
+    - Editing existing annotations
+    - Managing layers and labels
+    - Importing/exporting annotations
+    - Context menus for label changes
+    - Keyboard shortcuts for common actions
+
+    Signals:
+        annotation_changed: Emitted whenever annotations are added, modified, or deleted
+    """
+
+    # Signal emitted when any annotation changes in the scene
+    annotation_changed = pyqtSignal()
+    tool_mode_changed = pyqtSignal(str)
+
+    BOOST_Z = 1_000_000  # far above any real layer zValue (0–30)
+    CLICK_CYCLE_TOLERANCE_PX = 4  # viewport pixels — "same spot" for cycling
+
+    def __init__(self, db: DatabaseManager, parent=None):
+        """
+        Initialize the annotation scene.
+
+        Args:
+            db: Database manager instance for accessing annotation data
+            parent: Parent widget (optional)
+        """
+        super().__init__(parent)
+        self.db = db
+        self.undo_stack = QUndoStack(self)
+
+        # Set default scene size (will be updated when image is loaded)
+        self.setSceneRect(0, 0, 960, 540)
+        # Polygon drawing state
+        self.guide_line = None  # Temporary line showing current polygon edge
+        self.hovered_item = None  # Currently hovered annotation item
+        self._pose_overlay_item = None
+        self.selectionChanged.connect(self.clear_pose_overlay)
+        # ---------------------------------------------------------
+        # Area-ranked selection (CVAT-style overlap handling)
+        # ---------------------------------------------------------
+        self._active_top_item = None  # whichever item is currently z-boosted
+        self._active_top_item_base_z = 0.0  # its zValue before boosting, to restore
+        self._stack_badge = None  # lazily-created "N overlapping" indicator
+        self._stack_badge_text = None
+        self._last_click_viewport_pos = None
+        self._click_cycle_index = 0
+
+        self.selectionChanged.connect(self._on_selection_changed)
+
+        # Current tool mode (rectangle or polygon)
+        self.tool_mode = ToolMode.RECTANGLE
+
+        # Current layer and label settings for new annotations
+        self.current_layer = "ball"
+        self.current_label = "ball"
+        self.current_color = "#00FF00"
+
+        # Dictionary mapping layer names to their available labels
+        self.layer_labels = self.fetch_db_layers()
+
+        # The background image item
+        self.image_item: Optional[QGraphicsPixmapItem] = None
+
+        # Storage for annotation items organized by layer
+        self.layer_items = {
+            "players": [],  # Player bounding boxes or segmentation masks
+            "ball": [],  # Ball positions
+            "actions": [],  # Action annotations (spikes, blocks, etc.)
+        }
+        self.calibration = CalibrationOverlay(self)
+        self.calibration_mode = False
+
+        # Rectangle drawing state
+        self.start_pos: Optional[QPointF] = None  # Starting position of rectangle
+        self.temp_rect: Optional[AnnotationRectItem] = None  # Temporary rectangle being drawn
+
+        # Polygon drawing state
+        self.polygon_points: List[QPointF] = []  # Points of current polygon
+        self.temp_lines: List[QGraphicsLineItem] = []  # Temporary lines between points
+        self.temp_vertices: List[QGraphicsEllipseItem] = []  # Temporary vertex markers
+
+        # Image scaling factors for converting between display and original coordinates
+        self.display_width = 960
+        self.display_height = 540
+        self.scale_x = 1.0  # Scale factor from display to original width
+        self.scale_y = 1.0  # Scale factor from display to original height
+
+        self.current_media_path = None
+        self.current_media_type = None
+        self.current_frame_number = None
+
+    # ---------------------------------------------------------
+    # Image Management
+    # ---------------------------------------------------------
+
+    def fetch_db_layers(self) -> Dict[str, List[Label]]:
+        """
+        Fetch all layers and their associated labels from the database.
+
+        Returns:
+            Dictionary mapping layer names to lists of Label objects
+        """
+        layers = self.db.get_layers()
+        return {layer.name: layer.labels for layer in layers}
+
+    def set_layer_labels(self, layer_name: str, labels: List[Label]):
+        """
+        Update the labels for a specific layer.
+
+        Args:
+            layer_name: Name of the layer to update
+            labels: List of Label objects for this layer
+        """
+        self.layer_labels[layer_name] = labels
+
+    def set_current_layer(self, layer_name: str):
+        """
+        Set the active layer for new annotations.
+
+        Args:
+            layer_name: Name of the layer to set as current
+        """
+        self.current_layer = layer_name
+
+    def set_image(self, pixmap):
+        self.calibration.detach_items()
+        self.clear()
+        for key, _ in self.layer_items.items():
+            self.layer_items[key].clear()
+
+        self.cancel_polygon()
+        self.undo_stack.clear()
+        self._active_top_item = None
+        self._active_top_item_base_z = 0.0
+        self._stack_badge = None
+        self._stack_badge_text = None
+        self._last_click_viewport_pos = None
+        self._click_cycle_index = 0
+
+        self._pose_overlay_item = None
+        self.annotation_changed.emit()
+        self.image_item = self.addPixmap(pixmap)
+        self.image_item.setZValue(-100)
+        self.setSceneRect(QRectF(pixmap.rect()))
+
+    def set_calibration_mode(self, on: bool):
+        self.calibration_mode = on
+        self.cancel_polygon()
+        self.set_tool(ToolMode.NONE)
+        self._activate_top_item(None)
+        self._hide_stack_badge()
+        self.hovered_item = None
+        self.clearSelection()
+        self.clear_pose_overlay()
+
+        # Hide/show the normal annotation items so calibration is clean.
+        for records in self.layer_items.values():
+            for record in records:
+                record["item"].setVisible(not on)
+
+        self.calibration.set_active_step(self.calibration.active_key)
+        self.calibration.set_visible(on)
+
+    def set_image_scale(self, original_width: int, original_height: int):
+        """
+        Set the scaling factors for converting between display and original image coordinates.
+
+        Args:
+            original_width: Width of the original image
+            original_height: Height of the original image
+        """
+        self.scale_x = original_width / self.display_width
+        self.scale_y = original_height / self.display_height
+
+    # ---------------------------------------------------------
+    # Tool Management
+    # ---------------------------------------------------------
+
+    def set_tool(self, mode: str):
+        """
+        Set the active drawing tool.
+
+        Args:
+            mode: Tool mode (ToolMode.RECTANGLE or ToolMode.POLYGON)
+        """
+        # Cancel any ongoing polygon drawing when switching tools
+        self.cancel_polygon()
+        self.clear_pose_overlay()
+        self.tool_mode = mode
+        self.tool_mode_changed.emit(mode)
+
+    def set_current_label(self, label: str, color: str):
+        """
+        Set the active label and color for new annotations.
+
+        Args:
+            label: Name of the label
+            color: Hex color string for the annotation
+        """
+        self.current_label = label
+        self.current_color = color
+
+    # ---------------------------------------------------------
+    # Mouse Event Handling
+    # ---------------------------------------------------------
+
+    def mousePressEvent(self, event):
+        """
+        Handle mouse press events for drawing and interaction.
+
+        - Right click: Remove last polygon point during polygon drawing
+        - Left click on an existing annotation: resolve which one by
+          area-ranking (see _resolve_click_winner), boost it on top, and
+          let Qt's normal item flow handle selection/drag/resize
+        - Left click on empty space: Start drawing based on current tool
+        """
+        if self.calibration_mode:
+            if self.calibration.handle_press(event.scenePos(), event.button()):
+                event.accept()
+                return
+            QGraphicsScene.mousePressEvent(self, event)  # lets handles drag
+            return
+
+        if event.button() == Qt.MouseButton.RightButton:
+            if self.tool_mode == ToolMode.POLYGON and self.polygon_points:
+                self.remove_last_polygon_point()
+                event.accept()
+                return
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            winner = self._resolve_click_winner(event.scenePos())
+
+            if winner is not None:
+                self._activate_top_item(winner)
+                self._hide_stack_badge()
+                super().mousePressEvent(event)
+                return
+
+            self._activate_top_item(None)
+
+            if self.tool_mode == ToolMode.RECTANGLE:
+                self.start_rectangle(event.scenePos())
+                event.accept()
+                return
+            elif self.tool_mode == ToolMode.POLYGON:
+                self.add_polygon_point(event.scenePos())
+                event.accept()
+                return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.calibration_mode:
+            self.calibration.update_draft_preview(event.scenePos())
+            QGraphicsScene.mouseMoveEvent(self, event)
+            return
+
+        if self.temp_rect and self.start_pos:
+            rect = QRectF(self.start_pos, event.scenePos()).normalized()
+            self.temp_rect.setRect(rect)
+            event.accept()
+            return
+
+        if self.tool_mode == ToolMode.POLYGON and self.polygon_points:
+            last = self.polygon_points[-1]
+            if self.guide_line is None:
+                pen = QPen(QColor(self.current_color), 1, Qt.PenStyle.DashLine)
+                self.guide_line = self.addLine(
+                    last.x(), last.y(), event.scenePos().x(), event.scenePos().y(), pen,
+                )
+            else:
+                self.guide_line.setLine(
+                    last.x(), last.y(), event.scenePos().x(), event.scenePos().y(),
+                )
+            event.accept()
+            return
+
+        # NEW — CVAT-style hover ranking, skipped while a button is held
+        # (i.e. mid-drag/mid-resize on whatever Qt already grabbed).
+        if event.buttons() == Qt.MouseButton.NoButton:
+            if self.selectedItems():
+                # A selection is active — keep it pinned on top instead of
+                # re-ranking by area (see _on_selection_changed).
+                self._hide_stack_badge()
+            else:
+                self._update_area_based_stacking(event.scenePos())
+                self._update_stack_badge(event.scenePos())
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """
+        Handle mouse release to finish drawing operations.
+        """
+        if self.calibration_mode:
+            QGraphicsScene.mouseReleaseEvent(self, event)
+            return
+
+        if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self.temp_rect
+        ):
+            # Finish rectangle drawing
+            self.finish_rectangle()
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """
+        Handle double-click to finish polygon drawing.
+
+        Requires at least 4 points for a valid polygon.
+        """
+
+        if self.calibration_mode:
+            if self.calibration.handle_double_click(event.scenePos()):
+                event.accept()
+                return
+            QGraphicsScene.mouseDoubleClickEvent(self, event)
+            return
+
+        if self.tool_mode == ToolMode.POLYGON:
+            # Check if polygon has enough points
+            if len(self.polygon_points) < 4:
+                QMessageBox.warning(
+                    self.views()[0],
+                    "Invalid polygon",
+                    "A polygon must contain at least 4 points.",
+                )
+
+                self.cancel_polygon()
+                event.accept()
+                return
+
+            # Finish polygon drawing
+            self.finish_polygon()
+            event.accept()
+            return
+
+        super().mouseDoubleClickEvent(event)
+
+    # ---------------------------------------------------------
+    # Keyboard Shortcuts
+    # ---------------------------------------------------------
+
+    def keyPressEvent(self, event):
+        """
+        Handle keyboard shortcuts.
+
+        - Escape: Cancel polygon drawing
+        - Delete: Delete the currently hovered annotation
+        """
+
+        if self.calibration_mode:
+            key = event.key()
+            if key == Qt.Key.Key_Escape:
+                self.calibration.cancel_active_draft()
+            elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.calibration.finish_active()
+            elif key == Qt.Key.Key_Backspace or event.matches(QKeySequence.StandardKey.Undo):
+                self.calibration.undo_last_point()
+            else:
+                QGraphicsScene.keyPressEvent(self, event)
+                return
+            event.accept()
+            return
+
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancel_polygon()
+            self.set_tool(ToolMode.NONE)
+            event.accept()
+            return
+
+        if event.key() == Qt.Key.Key_Delete:
+            self.delete_hovered_item()
+            event.accept()
+            return
+
+        if event.matches(QKeySequence.StandardKey.Undo):
+            self.undo_stack.undo()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Redo):
+            self.undo_stack.redo()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+    # ---------------------------------------------------------
+    # Rectangle Drawing
+    # ---------------------------------------------------------
+
+    def start_rectangle(self, pos: QPointF):
+        """
+        Start drawing a rectangle annotation.
+
+        Args:
+            pos: Starting position of the rectangle
+        """
+        self.start_pos = pos
+        self.temp_rect = AnnotationRectItem(
+            QRectF(pos, pos),
+            self.current_color,
+            self.current_label,
+        )
+        self.temp_rect.set_layer(self.current_layer)
+        self.addItem(self.temp_rect)
+
+    def finish_rectangle(self):
+        """
+        Finish drawing a rectangle annotation.
+        Validates the rectangle and adds it to the scene.
+        """
+        rect = self.temp_rect.rect()
+
+        # Remove temporary rectangle from scene
+        self.removeItem(self.temp_rect)
+        self.temp_rect = None
+        self.start_pos = None
+
+        # Ignore accidental tiny rectangles (minimum 5x5 pixels)
+        if rect.width() < 5 or rect.height() < 5:
+            return
+
+        # Create permanent rectangle annotation
+        item = AnnotationRectItem(rect, self.current_color, self.current_label)
+        item.set_layer(self.current_layer)
+
+        record = {
+            "item": item,
+            "type": "rectangle",
+            "label": self.current_label,
+            "color": self.current_color,
+            "is_ai_generated": False,
+            "confirmed": True,
+            "annotation_id": None,
+            "track_id": None,  # NEW
+            "team_id": None,  # NEW
+        }
+
+        cmd = CreateAnnotationCommand(self, record, self.current_layer)
+        self.undo_stack.push(cmd)  # push() calls redo(), which adds the item + emits the signal
+
+    # ---------------------------------------------------------
+    # Polygon Drawing
+    # ---------------------------------------------------------
+
+    def add_polygon_point(self, pos: QPointF):
+        """
+        Add a vertex point to the current polygon being drawn.
+
+        Args:
+            pos: Position of the new vertex
+        """
+        # Connect previous point to new point with a line
+        if self.polygon_points:
+            last = self.polygon_points[-1]
+            line = self.addLine(
+                last.x(),
+                last.y(),
+                pos.x(),
+                pos.y(),
+                QPen(QColor(self.current_color), 2),
+            )
+            self.temp_lines.append(line)
+
+        # Remove existing guide line (will be recreated with new position)
+        if self.guide_line:
+            self.removeItem(self.guide_line)
+            self.guide_line = None
+
+        # Add vertex point
+        self.polygon_points.append(pos)
+
+        # Create a small circle marker for the vertex
+        vertex = self.addEllipse(
+            pos.x() - 1,
+            pos.y() - 1,
+            2,
+            2,
+            QPen(Qt.GlobalColor.white, 1),
+            QColor(self.current_color),
+        )
+        self.temp_vertices.append(vertex)
+
+    def remove_last_polygon_point(self):
+        """
+        Remove the last added polygon point (undo functionality).
+        """
+        if not self.polygon_points:
+            return
+
+        # Remove the point
+        self.polygon_points.pop()
+
+        # Remove the vertex marker
+        if self.temp_vertices:
+            v = self.temp_vertices.pop()
+            self.removeItem(v)
+
+        # Remove the connecting line
+        if self.temp_lines:
+            l = self.temp_lines.pop()
+            self.removeItem(l)
+
+    def finish_polygon(self):
+        """
+        Finish drawing a polygon and add it to the scene.
+        Creates a closed polygon from the drawn points.
+        """
+        # Remove guide line
+        if self.guide_line:
+            self.removeItem(self.guide_line)
+            self.guide_line = None
+
+        # Create the polygon
+        polygon = QPolygonF(self.polygon_points)
+
+        # Create permanent polygon annotation
+        item = AnnotationPolygonItem(polygon, self.current_color, self.current_label)
+        item.set_layer(self.current_layer)
+
+        record = {
+            "item": item,
+            "type": "polygon",
+            "label": self.current_label,
+            "color": self.current_color,
+            "track_id": None,
+            "team_id": None,
+        }
+
+        cmd = CreateAnnotationCommand(self, record, self.current_layer)
+        self.undo_stack.push(cmd)
+
+        # Clean up temporary drawing elements
+        self.cancel_polygon()
+
+    def cancel_polygon(self):
+        """
+        Cancel the current polygon drawing operation.
+        Removes all temporary elements and resets polygon state.
+        """
+        # Remove guide line
+        if self.guide_line:
+            self.removeItem(self.guide_line)
+            self.guide_line = None
+
+        # Remove all temporary lines
+        for line in self.temp_lines:
+            self.removeItem(line)
+
+        # Remove all temporary vertices
+        for vertex in self.temp_vertices:
+            self.removeItem(vertex)
+
+        # Clear temporary storage
+        self.temp_lines.clear()
+        self.temp_vertices.clear()
+        self.polygon_points.clear()
+
+    # ---------------------------------------------------------
+    # Hover Management
+    # ---------------------------------------------------------
+
+    def set_hovered_item(self, item):
+        """
+        Set the currently hovered annotation item.
+
+        Args:
+            item: The annotation item being hovered
+        """
+        self.hovered_item = item
+
+    def clear_hovered_item(self, item):
+        """
+        Clear the hovered state if it matches the given item.
+
+        Args:
+            item: The annotation item that is no longer hovered
+        """
+        if self.hovered_item == item:
+            self.hovered_item = None
+
+    # ---------------------------------------------------------
+    # Pose Preview (ephemeral — not an annotation, never persisted)
+    # ---------------------------------------------------------
+
+    def show_pose_overlay(self, rect_item, points: dict, confidences: dict):
+        """Attach a one-off pose preview to rect_item. Any previous
+        preview (on this or a different box) is removed first — only one
+        preview is ever shown at a time."""
+        self.clear_pose_overlay()
+        self._pose_overlay_item = PoseOverlayItem(points, confidences, rect_item)
+
+    def clear_pose_overlay(self):
+        if self._pose_overlay_item is not None:
+            try:
+                if self._pose_overlay_item.scene() is not None:
+                    self.removeItem(self._pose_overlay_item)
+            except RuntimeError:
+                pass  # parent box was already deleted, taking this with it
+            self._pose_overlay_item = None
+
+    # ---------------------------------------------------------
+    # Area-Ranked Selection (CVAT-style overlap handling)
+    # ---------------------------------------------------------
+    #
+    # Qt's own hit-testing (itemAt, mousePressEvent, hover dispatch) is
+    # always z-order based, so an overlapped small shape becomes
+    # unreachable once a bigger shape is drawn on top of it. CVAT solves
+    # this by ranking overlapping shapes by on-screen area and activating
+    # the smallest one — we replicate that here by temporarily boosting
+    # the winning item's zValue above its neighbors, then handing off to
+    # Qt's normal event flow. Every existing move/resize/vertex-edit code
+    # path in drawing_tools.py keeps working unmodified, because as far
+    # as Qt is concerned, the boosted item genuinely IS on top.
+
+    def _ranked_candidates_at(self, scene_pos: QPointF):
+        """
+        Every annotation item whose actual shape contains scene_pos,
+        ranked smallest-area first. Uses the same shape-based hit test as
+        itemAt (IntersectsItemShape), just returning every match instead
+        of only the topmost one.
+        """
+        view = self.views()[0] if self.views() else None
+        transform = view.transform() if view else QTransform()
+
+        candidates = [
+            it for it in self.items(
+                scene_pos, Qt.ItemSelectionMode.IntersectsItemShape,
+                Qt.SortOrder.DescendingOrder, transform,
+            )
+            if isinstance(it, (AnnotationRectItem, AnnotationPolygonItem))
+        ]
+
+        def _area(it):
+            r = it.sceneBoundingRect()
+            return max(r.width() * r.height(), 1.0)
+
+        candidates.sort(key=_area)
+        return candidates
+
+    def _activate_top_item(self, item):
+        """
+        Boost `item` above every overlapping sibling by zValue, restoring
+        whichever item was previously boosted. Idempotent — calling this
+        again with the same item (or None twice) is a no-op.
+        """
+        if item is self._active_top_item:
+            return
+
+        if self._active_top_item is not None:
+            self._active_top_item.setZValue(self._active_top_item_base_z)
+
+        self._active_top_item = item
+
+        if item is not None:
+            self._active_top_item_base_z = item.zValue()
+            item.setZValue(self.BOOST_Z)
+
+    def _update_area_based_stacking(self, scene_pos: QPointF):
+        """Pure hover ranking: always activates the smallest-area item
+        under the cursor. Only called while nothing is selected — once
+        something IS selected, it stays pinned on top instead (see
+        mouseMoveEvent / _on_selection_changed)."""
+        candidates = self._ranked_candidates_at(scene_pos)
+        self._activate_top_item(candidates[0] if candidates else None)
+
+    def _resolve_click_winner(self, scene_pos: QPointF):
+        """
+        Resolve which item a left-click should hit. Clicking fresh
+        somewhere always picks the smallest-area candidate (matches
+        hover). Clicking again at essentially the same screen position
+        advances to the next-largest candidate — this is what lets you
+        deliberately reach a bigger shape sitting underneath a small one,
+        rather than being stuck on the smallest match forever.
+        """
+        candidates = self._ranked_candidates_at(scene_pos)
+
+        if not candidates:
+            self._last_click_viewport_pos = None
+            self._click_cycle_index = 0
+            return None
+
+        view = self.views()[0] if self.views() else None
+        viewport_pos = view.mapFromScene(scene_pos) if view else None
+
+        same_spot = False
+        if viewport_pos is not None and self._last_click_viewport_pos is not None:
+            delta = viewport_pos - self._last_click_viewport_pos
+            same_spot = delta.manhattanLength() <= self.CLICK_CYCLE_TOLERANCE_PX
+
+        if same_spot:
+            self._click_cycle_index = (self._click_cycle_index + 1) % len(candidates)
+        else:
+            self._click_cycle_index = 0
+
+        self._last_click_viewport_pos = viewport_pos
+        return candidates[self._click_cycle_index]
+
+    def _on_selection_changed(self):
+        """Keep the selected item pinned on top for as long as it's
+        selected, regardless of what the cursor later hovers over — this
+        is what keeps a selected item's resize handles reliably clickable
+        even if the mouse wanders across a bigger overlapping sibling."""
+        selected = self.selectedItems()
+        if selected:
+            self._activate_top_item(selected[0])
+            self._hide_stack_badge()
+
+    # ---- Stack-depth badge (visual affordance for "there's more here") ----
+
+    def _ensure_stack_badge(self):
+        if self._stack_badge is not None:
+            return
+
+        badge = QGraphicsEllipseItem(0, 0, 18, 18)
+        badge.setBrush(QColor(0, 0, 0, 200))
+        badge.setPen(QPen(QColor('#FFD54A'), 1))
+        badge.setZValue(self.BOOST_Z + 10)
+        badge.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        badge.hide()
+        self.addItem(badge)
+
+        text = QGraphicsTextItem("", badge)
+        text.setDefaultTextColor(QColor('#FFD54A'))
+        font = text.font()
+        font.setBold(True)
+        font.setPointSize(8)
+        text.setFont(font)
+        text.setPos(4, 1)
+
+        self._stack_badge = badge
+        self._stack_badge_text = text
+
+    def _update_stack_badge(self, scene_pos: QPointF):
+        candidates = self._ranked_candidates_at(scene_pos)
+        if len(candidates) <= 1:
+            self._hide_stack_badge()
+            return
+
+        self._ensure_stack_badge()
+        self._stack_badge_text.setPlainText(str(len(candidates)))
+        self._stack_badge.setPos(scene_pos.x() + 10, scene_pos.y() - 24)
+        self._stack_badge.show()
+
+    def _hide_stack_badge(self):
+        if self._stack_badge is not None:
+            self._stack_badge.hide()
+
+    # ---------------------------------------------------------
+    # Context Menu
+    # ---------------------------------------------------------
+
+    def contextMenuEvent(self, event):
+        if self.calibration_mode:
+            return
+
+        item = self._active_top_item or self._resolve_click_winner(event.scenePos())
+        if item is None:
+            return
+
+        item = self.itemAt(event.scenePos(), self.views()[0].transform())
+        if item is None:
+            return
+
+        target = None
+        layer_name = None
+        for layer, records in self.layer_items.items():
+            for record in records:
+                if record["item"] == item:
+                    target = record
+                    layer_name = layer
+                    break
+            if target is not None:
+                break
+
+        if target is None:
+            return
+
+        menu = QMenu()
+
+        if layer_name in TRACKABLE_LAYERS:  # NEW
+            self._add_tracking_menu_section(menu, target, layer_name)
+            menu.addSeparator()
+
+        labels = self.layer_labels.get(layer_name, [])
+        for label in labels:
+            action = QAction(label.name, menu)
+            action.triggered.connect(
+                lambda checked=False, l=label.name, c=label.color, t=target: self.change_label(t, l, c)
+            )
+            menu.addAction(action)
+
+        menu.exec(event.screenPos())
+
+    def change_label(self, target: dict, label: str, color: str):
+        """
+        Change the label of an existing annotation (undoable).
+        """
+        if target["label"] == label and target["color"] == color:
+            return  # no-op, don't pollute the undo stack
+
+        cmd = ChangeLabelCommand(self, target, target["label"], target["color"], label, color)
+        self.undo_stack.push(cmd)
+
+    def _add_tracking_menu_section(self, menu: QMenu, target: dict, layer_name: str):
+        """
+        Embeds an editable, pre-filled tracking form at the top of the
+        right-click menu: "Player # / Team #" for the players layer, "Ball #"
+        for the ball layer. Integer-only; clearing a field unsets that value.
+        """
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(6)
+
+        track_edit = QLineEdit(container)
+        track_edit.setValidator(QIntValidator(0, TRACK_ID_MAX, container))
+        track_edit.setPlaceholderText("e.g. 10")
+        if target.get("track_id") is not None:
+            track_edit.setText(str(target["track_id"]))
+
+        team_edit = None
+        if layer_name == "players":
+            player_row = QHBoxLayout()
+            player_row.addWidget(QLabel("Player #"))
+            player_row.addWidget(track_edit)
+            layout.addLayout(player_row)
+
+            team_edit = QLineEdit(container)
+            team_edit.setValidator(QIntValidator(1, TEAM_ID_MAX, container))
+            team_edit.setPlaceholderText("1 or 2")
+            if target.get("team_id") is not None:
+                team_edit.setText(str(target["team_id"]))
+
+            team_row = QHBoxLayout()
+            team_row.addWidget(QLabel("Team #"))
+            team_row.addWidget(team_edit)
+            layout.addLayout(team_row)
+        else:  # ball
+            ball_row = QHBoxLayout()
+            ball_row.addWidget(QLabel("Ball #"))
+            ball_row.addWidget(track_edit)
+            layout.addLayout(ball_row)
+
+        apply_btn = QPushButton("Set")
+
+        def _commit():
+            def _parse(edit):
+                text = edit.text().strip()
+                return int(text) if text else None
+
+            self.set_track_info(target, _parse(track_edit),
+                                _parse(team_edit) if team_edit is not None else None)
+            menu.close()
+
+        apply_btn.clicked.connect(_commit)
+        track_edit.returnPressed.connect(_commit)
+        if team_edit is not None:
+            team_edit.returnPressed.connect(_commit)
+
+        layout.addWidget(apply_btn)
+
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(container)
+        menu.addAction(action)
+
+    def set_track_info(self, target: dict, track_id, team_id):
+        """Undoable edit of an annotation's track_id/team_id, triggered from
+        the right-click menu."""
+        if target.get("track_id") == track_id and target.get("team_id") == team_id:
+            return  # no-op, don't pollute the undo stack
+        cmd = ChangeTrackInfoCommand(
+            self, target, target["item"].layer_name,
+            target.get("track_id"), target.get("team_id"),
+            track_id, team_id,
+        )
+        self.undo_stack.push(cmd)
+
+    def set_media_context(self, media_path, media_type, frame_number):
+        """Called by MainWindow whenever the loaded frame/image changes, so
+        undo commands know which (media, frame) to write to / unconfirm."""
+        self.current_media_path = media_path
+        self.current_media_type = media_type
+        self.current_frame_number = frame_number
+
+    def _unconfirm_frame_for_layer(self, layer_name: Optional[str]):
+        """Invalidate any prior human confirmation for (current media,
+        layer_name, current frame). Called by every command that changes
+        an annotation's existence, geometry, or label."""
+        if layer_name is None or self.current_media_path is None:
+            return
+        layer = self.db.get_layer(layer_name)
+        if layer is None:
+            return
+        self.db.unconfirm_frame(self.current_media_path, layer.layer_id, self.current_frame_number)
+
+    # ---------------------------------------------------------
+    # Annotation Management
+    # ---------------------------------------------------------
+
+    def delete_hovered_item(self):
+        if self.hovered_item is None:
+            return
+
+        layer_name = self.hovered_item.layer_name
+        target_record = None
+        for record in self.layer_items.get(layer_name, []):
+            if record["item"] == self.hovered_item:
+                target_record = record
+                break
+        if target_record is None:
+            return
+
+        layer = self.db.get_layer(layer_name)
+        original_width = self.scale_x * self.display_width
+        original_height = self.scale_y * self.display_height
+
+        cmd = DeleteAnnotationCommand(
+            self,
+            target_record,
+            layer_name,
+            self.current_media_path,
+            self.current_media_type,
+            original_width,
+            original_height,
+            self.current_frame_number,
+            layer,
+        )
+        self.undo_stack.push(cmd)
+        self.hovered_item = None
+
+    def clear_annotations(self, layer_name=None):
+        """
+        Clear all annotations from the scene.
+
+        Args:
+            layer_name: Optional specific layer to clear. If None, clears all layers.
+        """
+        if layer_name is None:
+            # Clear all layers
+            for records in self.layer_items.values():
+                for record in records:
+                    self.removeItem(record["item"])
+
+            # Reset all layer lists
+            for key in self.layer_items:
+                self.layer_items[key] = []
+
+        else:
+            # Clear specific layer
+            records = self.layer_items.get(layer_name, [])
+
+            for record in records:
+                self.removeItem(record["item"])
+
+            self.layer_items[layer_name] = []
+
+        # Cancel any ongoing drawing
+        self.cancel_polygon()
+
+    def export_annotations(self, layer_name: str, path: str, frame_number: int) -> List[Annotation]:
+        """
+        Export annotations for a specific layer as database Annotation objects.
+
+        Args:
+            layer_name: Name of the layer to export
+            path: Media file path associated with these annotations
+            frame_number: Frame number (for video annotations)
+
+        Returns:
+            List of Annotation objects ready for database storage
+        """
+        annotations = []
+
+        for record in self.layer_items.get(layer_name, []):
+            item = record["item"]
+
+            # Convert geometry to original image coordinates
+            if record["type"] == "rectangle":
+                rect = item.sceneBoundingRect()
+                geometry = {
+                    "x": rect.x() * self.scale_x,
+                    "y": rect.y() * self.scale_y,
+                    "width": rect.width() * self.scale_x,
+                    "height": rect.height() * self.scale_y,
+                }
+            else:  # polygon
+                poly = item.mapToScene(item.polygon())
+                geometry = [
+                    [
+                        p.x() * self.scale_x,
+                        p.y() * self.scale_y,
+                    ]
+                    for p in poly
+                ]
+
+            # Get layer and label information from database
+            layer = self.db.get_layer(layer_name)
+            labels = {label.name: label for label in layer.labels}
+
+            # Create Annotation object
+            annotations.append(
+                Annotation(
+                    media_name=path,
+                    layer=layer,
+                    label=labels[record['label']],
+                    frame_number=frame_number,
+                    shape_type=record['type'],
+                    geometry=geometry,
+                    track_id=record.get("track_id"),
+                    team_id=record.get("team_id"),
+                )
+            )
+
+        return annotations
+
+    def load_annotations(self, annotations: List[Annotation], layer_name: str):
+        for ann in annotations:
+            color = ann.label.color if ann.label.color is not None else "#00FF00"
+
+            if ann.shape_type == "rectangle":
+                g = ann.geometry
+                rect = QRectF(g["x"] / self.scale_x, g["y"] / self.scale_y,
+                              g["width"] / self.scale_x, g["height"] / self.scale_y)
+                item = AnnotationRectItem(rect, color, ann.label.name,
+                                          track_id=ann.track_id, team_id=ann.team_id)  # NEW kwargs
+            elif ann.shape_type == "polygon":
+                polygon = QPolygonF([QPointF(x / self.scale_x, y / self.scale_y) for x, y in ann.geometry])
+                item = AnnotationPolygonItem(polygon, color, ann.label.name,
+                                             track_id=ann.track_id, team_id=ann.team_id)  # NEW kwargs
+            else:
+                continue
+
+            item.layer_name = ann.layer.name
+            z_values = {"players": 10, "ball": 20, "actions": 30}
+            item.setZValue(z_values.get(layer_name, 0))
+            self.addItem(item)
+
+            self.layer_items[layer_name].append({
+                "item": item, "type": ann.shape_type, "label": ann.label.name, "color": color,
+                "layer": ann.layer.name, "annotation_id": ann.annotation_id,
+                "is_ai_generated": ann.is_ai_generated, "confirmed": ann.confirmed,
+                "track_id": ann.track_id, "team_id": ann.team_id,  # NEW
+            })
+
+    def import_yolo_result(
+            self,
+            result,
+            layer: Layer,
+            original_width: int,
+            original_height: int,
+            media_path: str,  # NEW — needed to persist to DB
+            media_type: str,  # NEW
+            frame_number: Optional[int],  # NEW
+    ) -> int:
+        """
+        Import detections from a YOLO model result as ONE undoable batch.
+        Scene items + DB rows are created together via
+        BulkCreateAnnotationCommand; each row is flagged
+        is_ai_generated=True, confirmed=False.
+        """
+        sx = self.display_width / original_width
+        sy = self.display_height / original_height
+
+        layer_labels: Dict[str, Label] = {
+            label.name.lower(): label for label in layer.labels
+        }
+
+        records = []
+        db_annotations = []
+
+        def _queue(item, shape_type, label, geometry_original):
+            item.layer_name = layer.name
+            records.append({
+                "item": item,
+                "type": shape_type,
+                "label": label.name,
+                "color": label.color,
+                "is_ai_generated": True,
+                "confirmed": False,
+                "annotation_id": None,
+                "track_id": None,  # AI doesn't assign identities
+                "team_id": None,  #
+            })
+            db_annotations.append(
+                Annotation(
+                    media_name=media_path,
+                    layer=layer,
+                    label=label,
+                    frame_number=frame_number,
+                    shape_type=shape_type,
+                    geometry=geometry_original,
+                )
+            )
+
+        if result.masks is not None:
+            for mask, cls in zip(result.masks.xy, result.boxes.cls):
+                name = result.names[int(cls)].lower()
+                if layer.name == 'players' and name == 'person':
+                    name = 'player'
+                if name not in layer_labels:
+                    continue
+                label = layer_labels[name]
+
+                polygon = QPolygonF([QPointF(x * sx, y * sy) for x, y in mask])
+                item = AnnotationPolygonItem(polygon, label.color, label.name)
+                geometry_original = [[float(x), float(y)] for x, y in mask]
+                _queue(item, "polygon", label, geometry_original)
+
+        elif result.boxes is not None:
+            for box in result.boxes:
+                cls = int(box.cls[0])
+                name = result.names[cls].lower()
+                if layer.name == 'players' and name == 'person':
+                    name = 'player'
+                if name not in layer_labels:
+                    continue
+                label = layer_labels[name]
+
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                rect_display = QRectF(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy)
+                item = AnnotationRectItem(rect_display, label.color, label.name)
+                geometry_original = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
+                _queue(item, "rectangle", label, geometry_original)
+
+        if not records:
+            return 0
+
+        cmd = BulkCreateAnnotationCommand(
+            scene=self, db=self.db, layer_name=layer.name,
+            media_path=media_path, media_type=media_type,
+            width=original_width, height=original_height,
+            frame_number=frame_number, layer=layer,
+            records=records, annotations_for_db=db_annotations,
+            description=f"AI import ({layer.name})",
+        )
+        self.undo_stack.push(cmd)
+
+        return len(records)

@@ -6,10 +6,14 @@ from sqlalchemy import create_engine, String, Integer, DateTime, Text, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
+class Base(DeclarativeBase):
+    """Declarative base shared by all calibration ORM models (SQLAlchemy 2.x)."""
+
+
 # -----------------------------
 # ORM Model for Calibrations
 # -----------------------------
-class CalibrationRecord(DeclarativeBase):
+class CalibrationRecord(Base):
     __tablename__ = "calibrations"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -40,7 +44,7 @@ class CalibrationRecord(DeclarativeBase):
 # -----------------------------
 # ORM Model for Court Models
 # -----------------------------
-class CourtModel(DeclarativeBase):
+class CourtModel(Base):
     __tablename__ = "court_models"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -70,7 +74,7 @@ class CalibrationDB:
             future=True,
         )
 
-        DeclarativeBase.metadata.create_all(self.engine)
+        Base.metadata.create_all(self.engine)
 
         self.Session = sessionmaker(
             bind=self.engine,

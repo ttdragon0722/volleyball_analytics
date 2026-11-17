@@ -1,0 +1,691 @@
+"""
+Left Sidebar Module for VB Annotator
+
+Two tabs:
+  - "Frame Annotations": the existing per-frame layer/label/tool controls
+    (YOLO-style rectangle/polygon annotation) — unchanged behavior.
+  - "Video Annotations": the manual game-state tagging workflow (pick a
+    label, Mark Start, Mark End). Editing/deleting already-saved segments
+    happens on the Temporal Timeline panel, not here.
+"""
+
+from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+                             QFrame, QTabWidget)
+from .utils import create_navigation_button
+from .temporal_timeline import STATE_COLORS
+from .theme.theme import left_sidebar_style
+from .theme.theme_manager import register_themed_widget, repolish
+from src.vb_gui.vb_annotator.database.court_calibration import CALIBRATION_STEPS
+
+
+def _separator():
+    line = QFrame()
+    line.setObjectName("line")
+    line.setFrameShape(QFrame.Shape.HLine)
+    return line
+
+
+def _section(text):
+    label = QLabel(text)
+    label.setObjectName("section")
+    return label
+
+
+class LeftSideBar(QWidget):
+    """
+    Top-level left sidebar: hosts the Frame/Video tab widget and re-emits
+    the Frame tab's signals under the same names MainWindow already
+    connects to, plus new signals for the Video tab's create-flow.
+    """
+
+    # Frame Annotation tab (unchanged public surface)
+    layerChanged = pyqtSignal(str)
+    labelChanged = pyqtSignal(str)
+    toolChanged = pyqtSignal(str)
+
+    # Video Annotation tab (new)
+    videoLabelChanged = pyqtSignal(str)
+    videoMarkStartRequested = pyqtSignal(str)
+    videoMarkEndRequested = pyqtSignal()
+    videoCancelRequested = pyqtSignal()
+
+    # calibration signals block
+    calibrationUndoPointRequested = pyqtSignal(str)
+    calibrationModeChanged = pyqtSignal(bool)
+    calibrationStepSelected = pyqtSignal(str)
+    calibrationClearStepRequested = pyqtSignal(str)
+    calibrationClearAllRequested = pyqtSignal()
+    calibrationSaveRequested = pyqtSignal()
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(310)
+
+        self.setObjectName("leftSidebar")
+        register_themed_widget(self, left_sidebar_style)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        self.frame_tab = FrameAnnotationTab(db)
+        self.frame_tab.layerChanged.connect(self.layerChanged.emit)
+        self.frame_tab.labelChanged.connect(self.labelChanged.emit)
+        self.frame_tab.toolChanged.connect(self.toolChanged.emit)
+
+        self.calibration_tab = CourtCalibrationTab()
+        self.calibration_tab.stepSelected.connect(self.calibrationStepSelected.emit)
+        self.calibration_tab.clearStepRequested.connect(self.calibrationClearStepRequested.emit)
+        self.calibration_tab.clearAllRequested.connect(self.calibrationClearAllRequested.emit)
+        self.calibration_tab.saveRequested.connect(self.calibrationSaveRequested.emit)
+
+        self.tabs.addTab(self.calibration_tab, "Calibration")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._resize_to_tab(self.tabs.currentIndex())
+        self.tabs.addTab(self.frame_tab, "Frame")
+
+        self.video_tab = VideoAnnotationTab()
+        self.video_tab.labelChanged.connect(self.videoLabelChanged.emit)
+        self.video_tab.markStartRequested.connect(self.videoMarkStartRequested.emit)
+        self.video_tab.markEndRequested.connect(self.videoMarkEndRequested.emit)
+        self.video_tab.cancelRequested.connect(self.videoCancelRequested.emit)
+        self.tabs.addTab(self.video_tab, "Video")
+
+    # ---------------------------------------------------------
+    # Delegation — keeps MainWindow's existing calls (set_layer,
+    # set_tool, sync_tool_visuals, clear_tool_selection) working
+    # unchanged against the Frame tab.
+    # ---------------------------------------------------------
+
+    def _resize_to_tab(self, index):
+        widget = self.tabs.widget(index)
+        if widget is None:
+            return
+        widget.adjustSize()
+        content_width = widget.sizeHint().width()
+        tab_bar_width = self.tabs.tabBar().sizeHint().width()
+        target_width = max(content_width, tab_bar_width) + 12  # small frame/margin buffer
+        self.setFixedWidth(target_width)
+
+    def _on_tab_changed(self, index):
+        active = self.tabs.widget(index) is self.calibration_tab
+        self.frame_tab.set_suspended(active)
+        self.calibrationModeChanged.emit(active)
+        self._resize_to_tab(index)
+
+    def set_layer(self, layer):
+        self.frame_tab.set_layer(layer)
+
+    def set_tool(self, tool):
+        self.frame_tab.set_tool(tool)
+
+    def sync_tool_visuals(self, tool):
+        self.frame_tab.sync_tool_visuals(tool)
+
+    def clear_tool_selection(self):
+        self.frame_tab.clear_tool_selection()
+
+    # ---------------------------------------------------------
+    # Video tab delegation
+    # ---------------------------------------------------------
+
+    def set_video_tag_pending(self, pending: bool, start_frame=None, state=None):
+        self.video_tab.set_pending(pending, start_frame, state)
+
+    def cycle_layer(self):
+        self.frame_tab.cycle_layer()
+
+    def cycle_frame_label(self):
+        self.frame_tab.cycle_label()
+
+    def cycle_video_label(self):
+        self.video_tab.cycle_label()
+
+
+class FrameAnnotationTab(QWidget):
+    """
+    Per-frame annotation controls: layers, labels, and drawing tools.
+    This is the old LeftSideBar body, unchanged aside from the rename.
+    """
+
+    LAYER_ORDER = ["ball", "players", "actions"]
+    layerChanged = pyqtSignal(str)
+    labelChanged = pyqtSignal(str)
+    toolChanged = pyqtSignal(str)
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+
+        self.current_layer = None
+        self.current_label = None
+        self.current_tool = None
+        self._suspended = False
+
+        self.layer_rows = {}
+        self.label_buttons = {}
+        self.db = db
+        layers = self.db.get_layers()
+
+        self.layer_labels = {
+            layer.name: [
+                (label.name, label.color)
+                for label in layer.labels
+            ]
+            for layer in layers
+        }
+
+        self._build_ui()
+        self.set_layer("ball")
+        self.set_tool("none")
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(2)
+
+        title = QLabel("Annotation")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        layout.addWidget(_separator())
+        layout.addWidget(_section("Layers"))
+
+        for layer in self.LAYER_ORDER:
+            row = LayerRow(layer)
+            row.clicked.connect(self.set_layer)
+            self.layer_rows[layer] = row
+            layout.addWidget(row)
+
+        layout.addWidget(_separator())
+        layout.addWidget(_section("Labels"))
+
+        self.labels_container = QWidget()
+        self.labels_layout = QVBoxLayout(self.labels_container)
+        self.labels_layout.setContentsMargins(5, 5, 5, 5)
+        self.labels_layout.setSpacing(5)
+        layout.addWidget(self.labels_container)
+
+        layout.addWidget(_separator())
+        layout.addWidget(_section("Tools"))
+
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        icon_size = 28
+
+        self.none_btn = create_navigation_button(
+            tooltip="Selection tool (Esc)",
+            icon_path="./resources/icons/tools/cursor.png",
+            callback=lambda: self.set_tool("none"),
+            object_name="tool",
+            icon_size=icon_size - 5,
+        )
+        self.rect_btn = create_navigation_button(
+            tooltip="Rectangle Tool (R)",
+            icon_path="./resources/icons/tools/rectangle.png",
+            callback=lambda: self.set_tool("rectangle"),
+            object_name="tool",
+            icon_size=icon_size,
+        )
+        self.poly_btn = create_navigation_button(
+            tooltip="Polygon Tool (P)",
+            icon_path="./resources/icons/tools/pentagon.png",
+            callback=lambda: self.set_tool("polygon"),
+            object_name="tool",
+            icon_size=icon_size,
+        )
+        self.line_btn = create_navigation_button(
+            tooltip="Line tool: only available in Court Calibration",
+            icon_path="./resources/icons/tools/line.png",
+            callback=lambda: None,
+            object_name="tool",
+            icon_size=icon_size,
+        )
+        self.line_btn.setEnabled(False)
+
+        tools.addWidget(self.none_btn)
+        tools.addWidget(self.rect_btn)
+        tools.addWidget(self.poly_btn)
+        tools.addWidget(self.line_btn)
+        tools.addStretch()
+        layout.addLayout(tools)
+        layout.addWidget(_separator())
+
+    def set_layer(self, layer):
+        self.current_layer = layer
+        self.layerChanged.emit(layer)
+        for name, row in self.layer_rows.items():
+            row.set_active(name == layer and not self._suspended)
+        self.rebuild_labels()
+
+    def _refresh_label_visuals(self):
+        for name, btn in self.label_buttons.items():
+            active = (name == self.current_label) and not self._suspended
+            btn.setObjectName("activeLabel" if active else "labelButton")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def rebuild_labels(self):
+        while self.labels_layout.count():
+            item = self.labels_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        self.label_buttons.clear()
+
+        labels = self.layer_labels[self.current_layer]
+        self.current_label = labels[0][0]
+
+        for name, color in labels:
+            btn = QPushButton(name)
+            btn.clicked.connect(lambda checked=False, n=name: self.set_label(n))
+            self.label_buttons[name] = btn
+            self.labels_layout.addWidget(btn)
+
+        self.set_label(self.current_label)
+
+    def set_label(self, label):
+        self.current_label = label
+        self._refresh_label_visuals()
+        self.labelChanged.emit(label)
+
+    def set_tool(self, tool):
+        """User-initiated tool selection. Emits toolChanged."""
+        self._apply_tool_visuals(tool)
+        self.toolChanged.emit(tool)
+        for btn in [self.rect_btn, self.poly_btn, self.none_btn]:
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def clear_tool_selection(self):
+        self._apply_tool_visuals("none")
+
+    def sync_tool_visuals(self, tool):
+        self._apply_tool_visuals(tool)
+
+    def _apply_tool_visuals(self, tool):
+        self.current_tool = tool
+        shown = None if self._suspended else tool
+        for name, btn in (("rectangle", self.rect_btn),
+                          ("polygon", self.poly_btn),
+                          ("none", self.none_btn)):
+            btn.setObjectName("toolActive" if shown == name else "tool")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def set_suspended(self, suspended: bool):
+        """While Court Calibration is active, nothing here is highlighted;
+        the previous layer/label/tool are restored on the way back."""
+        self._suspended = suspended
+        for name, row in self.layer_rows.items():
+            row.set_active(name == self.current_layer and not suspended)
+        self._refresh_label_visuals()
+        self._apply_tool_visuals(self.current_tool or "none")
+
+    def cycle_layer(self):
+        idx = self.LAYER_ORDER.index(self.current_layer) if self.current_layer in self.LAYER_ORDER else -1
+        next_layer = self.LAYER_ORDER[(idx + 1) % len(self.LAYER_ORDER)]
+        self.set_layer(next_layer)
+
+    def cycle_label(self):
+        names = [name for name, _ in self.layer_labels[self.current_layer]]
+        if not names:
+            return
+        idx = names.index(self.current_label) if self.current_label in names else -1
+        next_name = names[(idx + 1) % len(names)]
+        self.set_label(next_name)
+
+    def set_publish_court_enabled(self, enabled: bool, reason: str = ""):
+        self.publish_court_btn.setEnabled(enabled)
+        self.publish_court_btn.setToolTip(
+            reason or
+            "Copy the court annotations from the current frame to every "
+            "frame inside a Service or In-Play segment of this video."
+        )
+
+
+class VideoLabelRow(QWidget):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, key, display, color):
+        super().__init__()
+        self.key = key
+        self.setObjectName("videoLabelRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(8)
+
+        swatch = QLabel()
+        swatch.setFixedSize(14, 14)
+        swatch.setStyleSheet(f"background:{color}; border-radius:3px;")
+        layout.addWidget(swatch)
+
+        self.name_btn = QPushButton(display)
+        self.name_btn.setFlat(True)
+        self.name_btn.clicked.connect(lambda: self.clicked.emit(key))
+        layout.addWidget(self.name_btn, 1)
+
+        self.set_active(False)
+
+    def set_active(self, active):
+        self.setProperty("active", "true" if active else "false")
+        repolish(self)
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self.name_btn.setEnabled(enabled)
+
+    # The container's own ":hover { background: ACCENT }" paints fine
+    # once WA_StyledBackground is set, but ":hover QPushButton { color:
+    # white }" is a descendant rule depending on THIS widget's hover
+    # state at the moment the child repaints. Rather than trust that
+    # timing across Qt/platform versions, force it explicitly.
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        repolish(self)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        repolish(self)
+
+
+class VideoAnnotationTab(QWidget):
+    """
+    Manual game-state tagging: pick a label, Mark Start, Mark End.
+    Nothing is written to the DB until both ends are set. Editing an
+    already-saved segment's range happens on the Temporal Timeline, not
+    here — this tab only creates new ones.
+    """
+
+    labelChanged = pyqtSignal(str)
+    markStartRequested = pyqtSignal(str)
+    markEndRequested = pyqtSignal()
+    cancelRequested = pyqtSignal()
+
+    STATES = [("service", "Service"), ("play", "In-Play"), ("no-play", "No-Play")]
+    STATE_ORDER = [key for key, _ in STATES]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pending = False
+        self.current_state = "service"
+        self.label_rows = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        layout.addWidget(_section("Game State Label  (Alt+3 to cycle)"))
+
+        for key, display in self.STATES:
+            row = VideoLabelRow(key, display, STATE_COLORS.get(key, "#FFFFFF"))
+            row.clicked.connect(self.set_label)
+            self.label_rows[key] = row
+            layout.addWidget(row)
+
+        self.set_label(self.current_state)
+
+        layout.addWidget(_separator())
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.action_button = QPushButton("Mark Start")
+        self.action_button.setFixedHeight(32)
+        self.action_button.clicked.connect(self._on_action_clicked)
+        layout.addWidget(self.action_button)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setFixedHeight(28)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.clicked.connect(self.cancelRequested.emit)
+        layout.addWidget(self.cancel_button)
+
+        layout.addWidget(_separator())
+
+        hint = QLabel(
+            "Pick a label, then Mark Start at the beginning of the segment "
+            "and Mark End where it ends — nothing is saved until both ends "
+            "are set. Already-saved tags can be dragged, resized, or "
+            "deleted directly on the Temporal Timeline below the video."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #9096A3; font-size: 11px;")
+        layout.addWidget(hint)
+
+        layout.addStretch()
+
+    def set_label(self, key):
+        self.current_state = key
+        for name, row in self.label_rows.items():
+            row.set_active(name == key)
+        self.labelChanged.emit(key)
+
+    def cycle_label(self):
+        if self._pending:
+            return  # don't allow switching label mid-tag
+        idx = self.STATE_ORDER.index(self.current_state)
+        next_state = self.STATE_ORDER[(idx + 1) % len(self.STATE_ORDER)]
+        self.set_label(next_state)
+
+    def _on_action_clicked(self):
+        if self._pending:
+            self.markEndRequested.emit()
+        else:
+            self.markStartRequested.emit(self.current_state)
+
+    def set_pending(self, pending: bool, start_frame=None, state=None):
+        self._pending = pending
+        for row in self.label_rows.values():
+            row.setEnabled(not pending)
+
+        if pending:
+            self.action_button.setText("Mark End")
+            self.cancel_button.setVisible(True)
+            self.status_label.setText(
+                f"Marking '{state}' — start at frame {start_frame}. "
+                f"Move to the end frame and click Mark End."
+            )
+        else:
+            self.action_button.setText("Mark Start")
+            self.cancel_button.setVisible(False)
+            self.status_label.setText("")
+
+
+class LayerRow(QWidget):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, layer_name):
+        super().__init__()
+        self.layer_name = layer_name
+        self.visible = True
+        self.setObjectName("layerRow")
+
+        # A plain QWidget never paints stylesheet background/border on
+        # its own — without this, #layerRow's active-highlight and
+        # hover rules are parsed but silently never drawn.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+
+        self.name_btn = QPushButton(layer_name)
+        self.name_btn.setFlat(True)
+        self.name_btn.clicked.connect(lambda: self.clicked.emit(layer_name))
+        layout.addWidget(self.name_btn, 1)
+
+        self.set_active(False)
+
+    def set_active(self, active: bool):
+        self.setProperty("active", "true" if active else "false")
+        # Repolishes self AND the child button in one call — see
+        # theme_manager.repolish for why the child needs it too.
+        repolish(self)
+
+
+class LabelRow(QPushButton):
+    def __init__(self, name, color):
+        super().__init__()
+        self.label_name = name
+        self.setText(f"●  {name}")
+
+class CalibrationStepRow(QWidget):
+    clicked = pyqtSignal(str)
+    clearClicked = pyqtSignal(str)
+    undoClicked = pyqtSignal(str)          # NEW
+
+    def __init__(self, step):
+        super().__init__()
+        self.key = step.key
+        self.setObjectName("videoLabelRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+
+        swatch = QLabel()
+        swatch.setFixedSize(14, 14)
+        swatch.setStyleSheet(f"background:{step.color}; border-radius:3px;")
+        layout.addWidget(swatch)
+
+        kind = "╱" if step.kind == "line" else "▱"
+        self.name_btn = QPushButton(f"{kind}  {step.label}")
+        self.name_btn.setFlat(True)
+        self.name_btn.clicked.connect(lambda: self.clicked.emit(self.key))
+        layout.addWidget(self.name_btn, 1)
+
+        self.status = QLabel("○")
+        layout.addWidget(self.status)
+
+        # NEW — pops the last point, even off a completed shape.
+        self.undo_btn = QPushButton("↺")
+        self.undo_btn.setFlat(True)
+        self.undo_btn.setFixedSize(26, 26)
+        self.undo_btn.setStyleSheet("QPushButton { padding: 0; font-size: 14px; }")
+        self.undo_btn.setToolTip("Undo last point of this shape")
+        self.undo_btn.clicked.connect(lambda: self.undoClicked.emit(self.key))
+        layout.addWidget(self.undo_btn)
+
+        self.clear_btn = QPushButton("✕")
+        self.clear_btn.setFlat(True)
+        self.clear_btn.setFixedSize(26, 26)
+        self.clear_btn.setStyleSheet("QPushButton { padding: 0; font-size: 13px; }")
+        self.clear_btn.setToolTip("Clear this whole shape")
+        self.clear_btn.clicked.connect(lambda: self.clearClicked.emit(self.key))
+        layout.addWidget(self.clear_btn)
+
+        self.set_active(False)
+
+    def set_active(self, active):
+        self.setProperty("active", "true" if active else "false")
+        repolish(self)
+
+    def set_done(self, done):
+        self.status.setText("✓" if done else "○")
+
+    def enterEvent(self, e):
+        super().enterEvent(e); repolish(self)
+
+    def leaveEvent(self, e):
+        super().leaveEvent(e); repolish(self)
+
+
+class CourtCalibrationTab(QWidget):
+    stepSelected = pyqtSignal(str)
+    clearStepRequested = pyqtSignal(str)
+    clearAllRequested = pyqtSignal()
+    undoPointRequested = pyqtSignal(str)  # NEW
+    saveRequested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_step = CALIBRATION_STEPS[0].key
+        self.rows = {}
+        self._build_ui()
+        self.set_active_step(self.current_step)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        layout.addWidget(_section("Court Calibration"))
+
+        for step in CALIBRATION_STEPS:
+            row = CalibrationStepRow(step)
+            row.clicked.connect(self._on_row_clicked)
+            row.clearClicked.connect(self.clearStepRequested.emit)
+            row.undoClicked.connect(self.undoPointRequested.emit)
+            self.rows[step.key] = row
+            layout.addWidget(row)
+
+        layout.addWidget(_separator())
+
+        self.hint_label = QLabel("")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+
+        # ------------------------------------------------------------
+        # NEW: read-only indicator of which tool is active for the
+        # currently selected shape (line vs polygon). There are no
+        # clickable tool buttons here — the tool is fixed per shape —
+        # this just tells the user what's in effect, since the Frame
+        # tab's Rectangle/Polygon buttons are suspended and give no
+        # useful signal while Calibration is the active tab.
+        # ------------------------------------------------------------
+        self.tool_label = QLabel("")
+        self.tool_label.setStyleSheet("color:#9096A3; font-size:11px; padding-top:4px;")
+        layout.addWidget(self.tool_label)
+
+        self.save_btn = QPushButton("Save Calibration")
+        self.save_btn.setMinimumHeight(34)
+        self.save_btn.setStyleSheet("QPushButton { padding: 6px 12px; }")
+        self.save_btn.clicked.connect(self.saveRequested.emit)
+        layout.addWidget(self.save_btn)
+
+        clear_all = QPushButton("Clear All")
+        clear_all.setMinimumHeight(32)
+        clear_all.setStyleSheet("QPushButton { padding: 6px 12px; }")
+        clear_all.clicked.connect(self.clearAllRequested.emit)
+        layout.addWidget(clear_all)
+
+        info = QLabel(
+            "Calibration belongs to the media file (one per video / per image). "
+            "Complete shapes are saved automatically when you leave this tab "
+            "or change media. Drag any point to adjust it. Ctrl+Z removes "
+            "the last point, Esc cancels the shape being drawn."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #9096A3; font-size: 11px;")
+        layout.addWidget(info)
+        layout.addStretch()
+
+    def _on_row_clicked(self, key):
+        self.set_active_step(key)
+        self.stepSelected.emit(key)
+
+    def set_active_step(self, key):
+        self.current_step = key
+        for k, row in self.rows.items():
+            row.set_active(k == key)
+        step = next(s for s in CALIBRATION_STEPS if s.key == key)
+        self.hint_label.setText(step.hint)
+
+        # NEW: update the tool indicator to match this shape's kind.
+        self.tool_label.setText(
+            f"Tool: {'Line (2 points)' if step.kind == 'line' else 'Polygon'} — fixed for this shape"
+        )
+
+    def set_status(self, completion: dict):
+        for key, row in self.rows.items():
+            row.set_done(bool(completion.get(key)))

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VideoMAE Labeler</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">VideoMAE Labeler</div>
+  <button id="btn-open" class="btn" title="用 Windows 的選擇檔案視窗開啟影片">開啟影片</button>
+  <button id="btn-recent" class="btn ghost" title="資料庫中已標註過的影片，或直接輸入路徑">已標註的影片</button>
+  <div id="video-name" class="video-name">尚未開啟影片</div>
+  <div class="spacer"></div>
+  <span id="model-status" class="save-status"></span>
+  <select id="model-select" class="model-select" title="「模型預標」要用哪個模型"></select>
+  <button id="btn-model" class="btn ghost" title="用 VideoMAE 模型重新預標整部影片（不會覆蓋你按住標註的部分）" disabled>模型預標</button>
+  <span id="save-status" class="save-status">—</span>
+  <button id="btn-save" class="btn primary" title="儲存到資料庫 (Ctrl+S)" disabled>儲存 <kbd>Ctrl+S</kbd></button>
+  <button id="btn-help" class="btn ghost" title="快捷鍵說明 (?)">說明</button>
+</header>
+
+<main class="layout">
+  <section class="stage">
+    <div class="video-wrap">
+      <video id="video" preload="auto" playsinline></video>
+      <div id="hud" class="hud">
+        <div id="hud-rec" class="hud-rec">按住 1 / 2 / 3 標註</div>
+        <div id="hud-state" class="hud-state no-play" hidden>NO-PLAY</div>
+        <div id="hud-under" class="hud-under"></div>
+      </div>
+      <div id="empty" class="empty">按「開啟影片」選擇要標註的影片</div>
+    </div>
+
+    <div class="controls">
+      <button id="btn-start" class="btn play" title="回到 0:00 (Home)">⏮</button>
+      <button id="btn-play" class="btn play" title="播放 / 暫停 (Space)">▶</button>
+      <div class="time"><span id="time-cur">00:00.00</span> / <span id="time-total">00:00.00</span></div>
+      <div class="frame">幀 <span id="frame-cur">0</span></div>
+      <div class="states" role="group" aria-label="按住標註">
+        <button class="state-btn service" data-state="service"><kbd>1</kbd> Service</button>
+        <button class="state-btn play" data-state="play"><kbd>2</kbd> Play</button>
+        <button class="state-btn no-play" data-state="no-play"><kbd>3</kbd> No-play</button>
+      </div>
+      <div class="spacer"></div>
+      <select id="speed" title="播放速度 ([ / ])">
+        <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+        <option value="0.75">0.75×</option><option value="1" selected>1×</option>
+        <option value="1.5">1.5×</option><option value="2">2×</option><option value="3">3×</option>
+      </select>
+      <button id="btn-undo" class="btn ghost" title="復原 (Ctrl+Z)">↶ 復原</button>
+      <button id="btn-redo" class="btn ghost" title="重做 (Ctrl+Y)">↷ 重做</button>
+    </div>
+
+    <div class="timeline-wrap">
+      <canvas id="overview" class="overview" height="18"></canvas>
+      <canvas id="timeline" class="timeline" height="96"></canvas>
+      <div class="timeline-hint">滾輪縮放 · Shift+滾輪 / 拖曳平移 · 點擊跳轉並選取片段 · 拖曳選取片段的邊緣調整範圍</div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <section class="panel" id="editor">
+      <h2>選取的片段</h2>
+      <div id="editor-empty" class="muted">點擊時間軸或下方清單中的片段來編輯</div>
+      <form id="editor-form" class="editor-form" hidden>
+        <div class="seg-states">
+          <label><input type="radio" name="state" value="service"><span class="chip service">Service</span></label>
+          <label><input type="radio" name="state" value="play"><span class="chip play">Play</span></label>
+          <label><input type="radio" name="state" value="no-play"><span class="chip no-play">No-play</span></label>
+        </div>
+        <div class="field">
+          <label for="ed-start">起點幀</label>
+          <input id="ed-start" type="number" min="0" step="1" required>
+          <button type="button" class="btn small" data-set="start" title="設為目前幀">⌖ 目前</button>
+          <span id="ed-start-t" class="muted mono"></span>
+        </div>
+        <div class="field">
+          <label for="ed-end">終點幀</label>
+          <input id="ed-end" type="number" min="0" step="1" required>
+          <button type="button" class="btn small" data-set="end" title="設為目前幀">⌖ 目前</button>
+          <span id="ed-end-t" class="muted mono"></span>
+        </div>
+        <div id="ed-source" class="muted"></div>
+        <div class="row">
+          <button type="submit" class="btn primary">套用</button>
+          <button type="button" id="ed-jump" class="btn">跳到起點</button>
+          <div class="spacer"></div>
+          <button type="button" id="ed-delete" class="btn danger" title="刪除 (Delete)">刪除</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel grow">
+      <div class="panel-head">
+        <h2>片段清單</h2>
+        <select id="list-filter">
+          <option value="all">全部</option><option value="manual">手動</option><option value="model">模型</option><option value="default">預設 no-play</option>
+        </select>
+      </div>
+      <div id="stats" class="stats"></div>
+      <ol id="seg-list" class="seg-list"></ol>
+    </section>
+  </aside>
+</main>
+
+<dialog id="picker" class="picker">
+  <form method="dialog" class="picker-inner">
+    <h2>已標註的影片</h2>
+    <div class="row">
+      <input id="pick-path" type="text" placeholder="D:/videos/match.mp4" spellcheck="false">
+      <button id="pick-open" class="btn primary" value="open">開啟</button>
+    </div>
+    <h3>資料庫中已有的影片</h3>
+    <ul id="pick-media" class="pick-list"></ul>
+    <div class="row end"><button class="btn ghost" value="cancel">取消</button></div>
+  </form>
+</dialog>
+
+<dialog id="help" class="picker">
+  <form method="dialog" class="picker-inner">
+    <h2>標註方式與快捷鍵</h2>
+    <ol class="help-flow">
+      <li>開啟影片後，時間軸預設是<b>模型的預測</b>：模型判成 play / service 的保留，其餘全部是 <b class="t-no-play">no-play</b>（半透明）。
+        要用模型預標，按右上角的「模型預標」。</li>
+      <li>播放影片，<b>按住</b> <kbd>1</kbd> Service／<kbd>2</kbd> Play／<kbd>3</kbd> No-play，放開就停止。按住期間播過的每一幀都會標成該狀態，<b>和模型重疊時以你按的為準</b>。</li>
+      <li>標錯了：點時間軸上的片段，在右側改狀態或範圍；或拖曳選取片段的邊緣；<kbd>Delete</kbd> 刪除（整段變回預設 no-play）。</li>
+      <li>所有修改都還<b>沒有存檔</b>，按 <kbd>Ctrl</kbd>+<kbd>S</kbd> 才會寫進資料庫。</li>
+    </ol>
+    <table class="keys">
+      <tr><td><kbd>Space</kbd></td><td>播放 / 暫停</td></tr>
+      <tr><td>按住 <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>標註 Service / Play / No-play</td></tr>
+      <tr><td><kbd>A</kbd> <kbd>←</kbd> ／ <kbd>D</kbd> <kbd>→</kbd></td><td>倒退 / 快轉 3 秒</td></tr>
+      <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>上一幀 / 下一幀</td></tr>
+      <tr><td><kbd>Home</kbd> / ⏮</td><td>回到 0:00</td></tr>
+      <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>降低 / 提高播放速度</td></tr>
+      <tr><td><kbd>Delete</kbd></td><td>刪除選取的片段</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> ／ <kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>復原 / 重做</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>儲存到資料庫</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>取消選取</td></tr>
+    </table>
+    <div class="row end"><button class="btn primary" value="close">知道了</button></div>
+  </form>
+</dialog>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
